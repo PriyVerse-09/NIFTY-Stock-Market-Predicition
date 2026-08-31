@@ -3,89 +3,57 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import joblib
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.models import load_model
 from pathlib import Path
 from datetime import datetime, timedelta
 from nsepython import nse_holidays
 import matplotlib.pyplot as plt
 
-# PAGE CONFIG
-st.set_page_config(
-    page_title="Hybrid ARIMA–LSTM NIFTY Predictor",
-    layout="wide",
-    page_icon="📈"
-)
+st.set_page_config(page_title="Hybrid ARIMA–LSTM NIFTY Predictor", layout="wide", page_icon="📈")
 
-# MODEL PATHS
 BASE_DIR = Path(__file__).resolve().parent
 ARIMA_PATH = BASE_DIR / "arima_model.pkl"
 LSTM_KERAS_PATH = BASE_DIR / "lstm_model.keras"
 LSTM_H5_PATH = BASE_DIR / "lstm_model.h5"
 SCALER_PATH = BASE_DIR / "residual_scaler.pkl"
 
-# LOAD MODELS
 @st.cache_resource
 def load_models():
-    missing = [
-        str(path.name)
-        for path in (ARIMA_PATH, SCALER_PATH)
-        if not path.exists()
-    ]
+    missing = [p.name for p in (ARIMA_PATH, SCALER_PATH) if not p.exists()]
     if missing:
-        raise FileNotFoundError(
-            "Missing model artifact(s): " + ", ".join(missing) +
-            ". Run training.py and place the generated artifacts in the repository root."
-        )
-
+        raise FileNotFoundError("Missing model artifact(s): " + ", ".join(missing) + ". Run training.py and place the generated artifacts in the repository root.")
     arima = joblib.load(ARIMA_PATH)
     scaler = joblib.load(SCALER_PATH)
-
-    # Prefer the modern Keras format when available. For the existing legacy
-    # H5 artifact, reconstruct the known architecture and load only its weights
-    # to avoid Keras H5 config deserialization errors.
     if LSTM_KERAS_PATH.exists():
         lstm = load_model(LSTM_KERAS_PATH, compile=False)
     elif LSTM_H5_PATH.exists():
-        lstm = Sequential([
-            LSTM(50, input_shape=(5, 1)),
-            Dropout(0.2),
-            Dense(1)
-        ])
+        lstm = Sequential([LSTM(50, input_shape=(5, 1)), Dropout(0.2), Dense(1)])
         lstm.build((None, 5, 1))
         lstm.load_weights(LSTM_H5_PATH)
     else:
-        raise FileNotFoundError(
-            "Missing LSTM model artifact: lstm_model.keras or lstm_model.h5. "
-            "Run training.py and place the generated artifact in the repository root."
-        )
-
+        raise FileNotFoundError("Missing LSTM model artifact: lstm_model.keras or lstm_model.h5. Run training.py and place the generated artifact in the repository root.")
     return arima, lstm, scaler
 
 arima_model, lstm_model, scaler = load_models()
 
-# DATA FETCH
 @st.cache_data
 def fetch_data():
     end = datetime.today()
     start = end - timedelta(days=365 * 4)
-
     df = yf.download("^NSEI", start=start, end=end, interval="1d")
-
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
-    df = df[['Close']].dropna()
+    df = df[["Close"]].dropna()
+    if df.empty:
+        raise ValueError("No NIFTY data was downloaded from Yahoo Finance.")
     return df
 
 df = fetch_data()
 
-# TITLE
 st.title("Hybrid ARIMA–LSTM NIFTY Prediction Dashboard")
 st.caption("Short-term forecasting using ARIMA + LSTM residual correction")
 
-# NEXT TRADING DAY
 holidays = nse_holidays()
 
 def next_trading_day(d):
@@ -94,38 +62,48 @@ def next_trading_day(d):
         d += timedelta(days=1)
     return d
 
-# ONE DAY PREDICTION LOGIC
-full_close = df['Close'].values
-arima_fitted = np.array(arima_model.fittedvalues).flatten()
+# FIX: The saved ARIMA result was trained on a pandas Series. Calling
+# arima_model.forecast() directly after loading it can fail with
+# "ValueError: No supported index is available." Apply the saved model to
+# the current dated NIFTY Series first, which gives statsmodels a supported
+# DatetimeIndex for forecasting.
+current_series = df["Close"].astype(float)
 
-min_len = min(len(full_close), len(arima_fitted))
-residuals = full_close[-min_len:] - arima_fitted[-min_len:]
-residuals = residuals.reshape(-1, 1)
+try:
+    arima_current = arima_model.apply(current_series, refit=False)
+    arima_next = float(np.asarray(arima_current.forecast(steps=1)).reshape(-1)[0])
+except Exception as exc:
+    # Safe fallback for statsmodels versions where apply() cannot reuse the
+    # serialized result object with the downloaded series.
+    from statsmodels.tsa.arima.model import ARIMA
+    order = getattr(arima_model.model, "order", None)
+    if order is None:
+        raise RuntimeError("Unable to determine the ARIMA order from arima_model.pkl.") from exc
+    arima_current = ARIMA(current_series, order=order).fit()
+    arima_next = float(np.asarray(arima_current.forecast(steps=1)).reshape(-1)[0])
 
-scaled_resid = scaler.transform(residuals)
+# Use residuals from the current ARIMA model for the LSTM correction.
+arima_fitted_values = np.asarray(arima_current.fittedvalues).reshape(-1)
+arima_fitted = pd.Series(
+    arima_fitted_values,
+    index=current_series.index[-len(arima_fitted_values):]
+)
+residual_series = (current_series.loc[arima_fitted.index] - arima_fitted).dropna()
 
 time_steps = 5
-if len(scaled_resid) < time_steps:
-    raise ValueError(
-        f"Not enough residual observations for the LSTM window. "
-        f"Required {time_steps}, found {len(scaled_resid)}."
-    )
+if len(residual_series) < time_steps:
+    raise ValueError(f"Not enough residual observations for the LSTM window. Required {time_steps}, found {len(residual_series)}.")
 
+scaled_resid = scaler.transform(residual_series.to_numpy(dtype=float).reshape(-1, 1))
 X_last = scaled_resid[-time_steps:].reshape(1, time_steps, 1)
-
-lstm_next_scaled = lstm_model.predict(X_last, verbose=0)[0][0]
-lstm_next_resid = float(
-    scaler.inverse_transform([[lstm_next_scaled]])[0][0]
-)
-
-arima_next = float(arima_model.forecast(steps=1).iloc[0])
+lstm_next_scaled = float(lstm_model.predict(X_last, verbose=0)[0][0])
+lstm_next_resid = float(scaler.inverse_transform(np.array([[lstm_next_scaled]]))[0][0])
 next_pred = float(arima_next + lstm_next_resid)
 
 last_date = df.index[-1].date()
 next_date = next_trading_day(last_date)
-prev_close = float(full_close[-1])
+prev_close = float(current_series.iloc[-1])
 
-# DISPLAY RESULTS
 summary_df = pd.DataFrame({
     "Date": [last_date, next_date],
     "Close Value": [round(prev_close, 2), round(next_pred, 2)]
@@ -134,52 +112,23 @@ summary_df = pd.DataFrame({
 st.subheader("📅 Prediction Summary")
 st.dataframe(summary_df, use_container_width=True)
 
-# FORECAST CURVE
 st.subheader("📈 Forecast Curve")
-
-past_days = st.selectbox(
-    "Show past days",
-    options=[1, 2, 3, 4],
-    index=3
-)
-
-prev_close = float(df['Close'].iloc[-1])
-next_pred = float(next_pred)
-
+past_days = st.selectbox("Show past days", options=[1, 2, 3, 4], index=3)
 past_dates = list(df.index[-past_days:].date)
-past_values = [float(x) for x in df['Close'].iloc[-past_days:]]
-
+past_values = [float(x) for x in current_series.iloc[-past_days:]]
 plot_dates = past_dates + [next_date]
 plot_values = past_values + [next_pred]
 
 fig, ax = plt.subplots(figsize=(8, 4))
-
-ax.plot(
-    plot_dates,
-    plot_values,
-    marker='o',
-    linewidth=2
-)
-
-ax.scatter(
-    plot_dates[-1],
-    plot_values[-1],
-    color='red',
-    s=80,
-    label="Prediction"
-)
-
+ax.plot(plot_dates, plot_values, marker="o", linewidth=2)
+ax.scatter(plot_dates[-1], plot_values[-1], color="red", s=80, label="Prediction")
 import matplotlib.dates as mdates
 ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-ax.xaxis.set_major_formatter(mdates.DateFormatter('%d-%b'))
-
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
 ax.set_xlabel("Date")
 ax.set_ylabel("Close Price")
 ax.grid(True)
 ax.legend()
-
 plt.xticks(rotation=45)
 st.pyplot(fig)
-
-# FOOTER
 st.markdown("---")
