@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import joblib
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.models import load_model
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -19,7 +21,8 @@ st.set_page_config(
 # MODEL PATHS
 BASE_DIR = Path(__file__).resolve().parent
 ARIMA_PATH = BASE_DIR / "arima_model.pkl"
-LSTM_PATH = BASE_DIR / "lstm_model.keras"
+LSTM_KERAS_PATH = BASE_DIR / "lstm_model.keras"
+LSTM_H5_PATH = BASE_DIR / "lstm_model.h5"
 SCALER_PATH = BASE_DIR / "residual_scaler.pkl"
 
 # LOAD MODELS
@@ -27,7 +30,7 @@ SCALER_PATH = BASE_DIR / "residual_scaler.pkl"
 def load_models():
     missing = [
         str(path.name)
-        for path in (ARIMA_PATH, LSTM_PATH, SCALER_PATH)
+        for path in (ARIMA_PATH, SCALER_PATH)
         if not path.exists()
     ]
     if missing:
@@ -37,8 +40,27 @@ def load_models():
         )
 
     arima = joblib.load(ARIMA_PATH)
-    lstm = load_model(LSTM_PATH, compile=False)
     scaler = joblib.load(SCALER_PATH)
+
+    # Prefer the modern Keras format when available. For the existing legacy
+    # H5 artifact, reconstruct the known architecture and load only its weights
+    # to avoid Keras H5 config deserialization errors.
+    if LSTM_KERAS_PATH.exists():
+        lstm = load_model(LSTM_KERAS_PATH, compile=False)
+    elif LSTM_H5_PATH.exists():
+        lstm = Sequential([
+            LSTM(50, input_shape=(5, 1)),
+            Dropout(0.2),
+            Dense(1)
+        ])
+        lstm.build((None, 5, 1))
+        lstm.load_weights(LSTM_H5_PATH)
+    else:
+        raise FileNotFoundError(
+            "Missing LSTM model artifact: lstm_model.keras or lstm_model.h5. "
+            "Run training.py and place the generated artifact in the repository root."
+        )
+
     return arima, lstm, scaler
 
 arima_model, lstm_model, scaler = load_models()
